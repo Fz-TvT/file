@@ -175,3 +175,21 @@ pool.Release(buf);                    // 归还池中，不注销
 长期持有注册	初始化注册一次，不注销	零注销开销（最有效的做法）
 Buffer Pool	预注册的 buffer 循环使用	零 reg/dereg 开销
 核心设计思想：不要把 register/unregister 当成每次传输的配对操作，而是当成 buffer 生命周期管理操作。 注册一次，反复用，最后统一注销，这才是正确的使用模式。对于一次性的临时 buffer，目前没有懒注销队列来优化，这是未来可以改进的方向。
+
+同一批任务，同步 vs 异步
+当前同步（单线程顺序执行）：
+
+
+Task 1: [prep][████ D2H ████][meta][get][dump_submit]
+Task 2:                                         [prep][████ D2H ████][meta][get][dump_submit]
+Task 3:                                                                         [prep][████ D2H ████]...
+                                                                                                    ↑
+                                                                                          总时间 ≈ 3 × T
+异步（可以重叠 prep 和 D2H）：
+
+
+Task 1: [prep][████ D2H ████][meta][get][dump_submit]
+Task 2:       [prep]          [████ D2H ████][meta][get][dump_submit]
+Task 3:             [prep]          [████ D2H ████][meta][get][dump_submit]
+                                                                               ↑
+                                                                    总时间 ≈ T
