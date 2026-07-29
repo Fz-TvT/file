@@ -193,3 +193,59 @@ Task 2:       [prep]          [████ D2H ████][meta][get][dump_su
 Task 3:             [prep]          [████ D2H ████][meta][get][dump_submit]
                                                                                ↑
                                                                     总时间 ≈ T
+
+# 对整体处理时间的影响
+
+## 同步版（当前）
+
+Worker 线程时间线：
+│── Dump A (MSetD2H 50ms) ──│── Dump B (MSetD2H 30ms) ──│── Dump C (MSetD2H 20ms) ──│
+                              ↑ B 必须等 A 完成才能开始
+
+3 个 dump 总耗时: 50 + 30 + 20 = 100ms（串行）
+## 如果用异步
+
+Worker 线程时间线：
+│── 提交 A ──│── 提交 B ──│── 提交 C ──│── future.get(A) ──│── future.get(B) ──│── future.get(C) ──│
+  0.01ms       0.01ms       0.01ms      50ms (等 A 完成)    30ms (B 已跑完)      20ms (C 已跑完)
+                                          ↑ 3 个 D2H 在后台并行
+3 个 dump 总耗时：max(50, 30, 20) ≈ 50ms（并发）
+
+差距随队列深度放大： 10 个 50ms 的 dump，同步 500ms，异步 ≈ 50ms（前提是并发度够）。
+
+对 TTFT 的影响
+TTFT（首 token 延迟）的关键路径是：
+
+
+请求到达 → 调度 → 分配 GPU 内存 → 加载 KV cache → Prefill → 首 token
+                        ↑
+              如果内存不够 → 先 evict (dump) 释放内存
+同步 MSetD2H 影响 TTFT 的条件是：
+
+内存压力正常时 — 无影响
+
+提前在后台慢慢 dump：                           请求到达
+│── dump ──│── dump ──│── dump ──│─────────────│── 内存够 → 加载 → prefill → 首 token
+                                       TTFT 不受 dump 影响
+只要 dump 在请求到达前完成了，同步异步对 TTFT 没有区别。
+
+内存压力大（burst 场景）— 有显著影响
+
+请求到达：内存不够！
+需要先 dump 再加载
+
+同步：                               异步：
+│── dump A ──│── dump B ──│          │── dump A ──│
+                     │── 加载 ──│                │── dump B ──│
+                              │── prefill ──│                │── 加载 ──│
+                                       ↑ TTFT                        ↑ TTFT = 少等一个 B
+核心逻辑：dump 队列累计延迟越长，释放内存越慢 → 新请求等内存越久 → TTFT 越大。
+
+数值估算
+假设 burst 瞬间来 4 个请求，各需要 evict 1 个 block（每个 MSetD2H 50ms）：
+
+同步	异步（4 并发）
+排队 dump 全部完成	200ms	50ms
+最后一个请求等到内存	200ms	50ms
+额外增加的 TTFT	+200ms	+50ms
+同步下最后一个请求的 TTFT 比异步多等 150ms。
