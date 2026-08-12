@@ -16,6 +16,31 @@ MindIE Motor 支持 PD 分离架构下的 **KV Cache 池化**：Prefill（P）�
 
 后端接入链路四块：**配置层 → deployer（K8s 生成）→ 节点生命周期（NodeManager）→ 指标采集**；另有 kv-conductor（Rust）与调度器 KV 亲和链路按后端模式分发。
 
+**YuanRong 接入架构总览**（引擎、worker、etcd、守护与匹配，一图看完）：
+
+```text
+引擎 Pod（vLLM，--kv-transfer-config 声明 YuanRongConnector）
+        │
+   ┌────┴─────────────────────────────────────┐
+   │  ① P 算完 KV 写入   ────▶  ② D 按需读取 KV  │
+   ▼                                          ▼
+┌────────────────────────────────────────────────┐
+│            datasystem_worker（每节点 1 个）       │
+│      worker_address = host:31501               │
+│      ├─ 本地 KV 存储                            │
+│      └─ kv_metrics.log（JSON Lines 指标）        │
+└─────────────────────┬──────────────────────────┘
+                      │  ③ 位置上报 / 查询
+                      ▼
+              ┌────────────────┐
+              │ etcd（外部依赖） │
+              └────────────────┘
+
+守护：NodeManager ──▶ dscli start / stop ──▶ ready/liveness 文件探活
+匹配：conductor ──▶ DP→节点→worker_address（ZMQ PUB-SUB 扇出到节点内全部 DP）
+指标：coordinator ◀── NodeManager 周期性转发 ◀── kv_metrics.log
+```
+
 ---
 
 ## 2. MemCache 后端接入全解析（参照）
@@ -122,6 +147,21 @@ D 实例 → 查 MetaService 定位块 → 按协议从 P 节点拉取 → 跳�
 | 无 per-DP 端口 | 仓库没有 per-DP 端口概念；`oc_worker_worker_direct_port`/`sc_worker_worker_direct_port`/`shared_memory_worker_port` 均非 per-DP | 端口 flags |
 
 **冲突**：Motor 侧 conductor 当前假设 `MatchMode::None` = "subscriber tied to a fixed dp_rank"，即 **per-DP 端口订阅**（[backend.rs:82](motor/kv_conductor/src/backend.rs#L82)）。若按端口映射 DP 会撞车（同节点多 DP 共享一端口）。
+
+**现状 vs 方案 A 拓扑**（一图看懂冲突与出路）：
+
+```text
+[现状] conductor 假设 per-DP 端口订阅（会撞车）     [方案 A] 一节点一 worker（推荐）
+
+  节点 1                                  节点 1
+  DP0    DP1    DP2                      DP0  DP1  DP2
+   │      │      │                        └────┴─────┐
+   ▼      ▼      ▼                                   ▼
+ :30001 :30002 :30003                       worker 1  :31501
+  端口=DP 偏移，DP 数变化即错位              一个端口服务节点内全部 DP
+                                          conductor 按 worker_address 命中节点，
+                                          再按 dp_rank 落到具体 DP
+```
 
 **两条出路**：
 - **A（推荐）**：Motor 自建「DP → 节点 → worker_address」拓扑（Motor 本就是发起部署的一方，掌握 endpoints/DP 分布），注册时按节点聚合上报、显式带 `dp_rank`；conductor 的 YuanRong 匹配语义需从「端口=DP」改为「按节点聚合 worker + 节点内多 DP」。
@@ -233,6 +273,37 @@ class YuanRongWorker:
 - **可选兜底**：按 `worker_address` 从进程表找 `datasystem_worker` PID 做进程级校验，与文件探活双保险。
 - 直跑二进制路径（拍板项 1 → B）会显著简化：`Popen(["datasystem_worker", ...])` + `poll()`，但需 Motor 自实现 dscli 的配置/锁重试/ready 逻辑，工作量大，不推荐。
 
+**worker 生命周期状态流转**：
+
+```text
+        ┌──────────┐ ─(1) dscli start + 等 ready──▶ ┌──────────┐
+        │  stopped │                                │  running │
+        └──────────┘ ◀─(3) stop 正常退出／进程退出─── └────┬─────┘
+              ▲                                        │ (2) liveness 文件超时
+              │                                        ▼
+              └────────(4) restart = stop+start────────┌──────────┐
+                                                      │   僵死    │
+                                                      └──────────┘
+
+(1) pull()：dscli start → 轮询 ready_check_path 出现 → running
+(2) health_check()：每 5s 查 liveness 文件 mtime，超时未更新 → 僵死
+(3) stop()：dscli stop 优雅退出（超时兜底）
+(4) restart_worker=True：僵死后 stop + start 重新拉起
+```
+
+**守护与重启时序**（NodeManager / dscli / datasystem_worker / liveness 文件）：
+
+```text
+① NodeManager ── dscli start ──▶ dscli
+② dscli ── Popen 拉起 ──▶ datasystem_worker
+③ worker 初始化完成 → 写 ready_check_path 文件
+④ dscli 等 ready 文件出现 → 返回 SUCCESS 退出（进程已退出，无 PID 可 poll）
+⑤ worker 周期写 liveness 文件 → NodeManager 每 5s 查 mtime
+⑥ 某次 mtime 过期 → health_check 判定僵死
+⑦ restart_worker=True → dscli stop（停 worker，优雅退出）
+⑧ dscli start → 重新拉起新 worker（回到 ① 循环）
+```
+
 ### 5.3 注册与生效机制（改动极小）
 
 `motor/node_manager/core/services/registry.py` 的 `_DEFAULT_MODULE_MAP` 加 1 行：
@@ -261,6 +332,27 @@ kv_cache_store_config.backend = "yuanrong"
 - `examples/deployer/lib/generator/k8s_utils.py`：ConfigMap 打包 `kv_store_backends.yuanrong.*` 脚本；`build_kv_store_env_items()` 加引擎侧 `YRC_*` 环境变量。
 - **etcd 模板：默认不生成**（复用外部 etcd）；仅当选择自部署时才新增 `etcd_template.yaml`（StatefulSet，yuanrong 仓库无可复用清单，参考脚本是单实例 etcd）。
 
+**Deployer 生成链路**（配置 → K8s → 引擎/守护 → 拉起 worker）：
+
+```text
+deploy.py
+   ├─ normalize_kv_cache_store_config()：backend 判为 yuanrong
+   ├─ gen_kv_store_env()：注入 YRC_WORKER_ADDRESS / YRC_ETCD_ADDRESS / 探活路径
+   ├─ create_motor_config_configmap()：打包脚本 + 配置 → ConfigMap
+   └─ 生成引擎 Pod YAML（注入 KVS_MASTER_SERVICE / KV_STORE_BACKEND=yuanrong）
+              │
+              ▼ K8s 创建
+   ┌──────────────────────────────────────────────┐
+   │ 引擎 Pod                                      │
+   │  engine.sh ──▶ sync_yuanrong_config()         │
+   │    （解析 env → 导出 worker 侧配置，不拉起 worker） │
+   │   └─▶ Daemon 启动 ──▶ registry.discover()      │
+   │        导入 yuanrong.lifecycle                 │
+   │        └─▶ YuanRongWorker 注册进守护名单        │
+   │              └─▶ pull_kv_store() → dscli start → 等 ready
+   └──────────────────────────────────────────────┘
+```
+
 ### 5.5 启动脚本
 
 ```
@@ -272,15 +364,28 @@ examples/deployer/startup/roles/kv_store_backends/yuanrong/
 - `engine.sh` / `all_combine_in_single_container.sh`：各加 `yuanrong)` 分支，只调 `sync_yuanrong_config()`。
 - `kv_cache_store.sh` 已通用，无需改。
 
-### 5.6 指标采集（已定决策 4 → 解析 kv_metrics.log）
+### 5.6 指标采集
 
 `motor/coordinator/metrics/metrics_collector.py`：
 
 - `_filter_kvstore_metrics()` 加 `elif backend == "yuanrong":` 分发；
 - 按已定决策 4 实现 `_filter_yuanrong_metrics()`（方案 B 定为最终方案，A/C 否决）：
   - **方案 B（最终）**：解析各节点 `kv_metrics.log`（JSON Lines，默认开启）取自定义指标（容量/key/淘汰），映射到公共 `kv_store_*` 四族。`kv_metrics.log` 在 worker 节点本地，coordinator 经 NodeManager 周期性转发获取（复用 NodeManager 已有的日志/状态上报通道或共享卷）。
-  - ~~方案 A~~（否决）：brpc 层指标非 `kv_store_*` 目标。
-  - ~~方案 C~~（否决）：暂不实现。
+
+**指标采集链路**：
+
+```text
+① worker 写本地指标
+     datasystem_worker ──写──▶ kv_metrics.log（JSON Lines）
+                                    │
+② NodeManager 周期性转发 ───────────┘（复用已有日志/状态上报通道或共享卷）
+                                    ▼
+③ coordinator 聚合        metrics_collector
+                              └─ _filter_kvstore_metrics
+                                   └─ _filter_yuanrong_metrics
+                                        └─ kv_store_* 四族
+                                        （size / ratio / keys / eviction）
+```
 
 ### 5.7 Conductor 侧调整（已定决策 3 → 按节点聚合）
 
