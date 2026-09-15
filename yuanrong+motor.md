@@ -232,7 +232,7 @@ WantedBy=multi-user.target
       "kv_connector_extra_config": {
         "connectors": [
           {
-            "kv_connector": "MooncakeConnectorV1",
+            "kv_connector": "MooncakeHybridConnector",
             "kv_role": "kv_producer",
             "kv_port": "30001",
             "kv_connector_extra_config": {}
@@ -280,7 +280,7 @@ WantedBy=multi-user.target
       "kv_connector_extra_config": {
         "connectors": [
           {
-            "kv_connector": "MooncakeConnectorV1",
+            "kv_connector": "MooncakeHybridConnector",
             "kv_role": "kv_consumer",
             "kv_port": "30002",
             "kv_connector_extra_config": {}
