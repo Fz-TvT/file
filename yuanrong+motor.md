@@ -37,13 +37,13 @@ cd etcd-${ETCD_VER}-linux-amd64
 sudo cp etcd etcdctl /usr/local/bin/
 ```
 
-3. **已安装 yuanrong 安装包**（提供 `dscli` 或 `dsc1` 命令行）。
+3. **已安装 yuanrong 安装包**（提供 `dscli` 命令行）。
 
 ## 3. 部署步骤
 
 ### 3.1 安装 yuanrong 安装包（制作镜像时）
 
-在 P/D 节点motor镜像内安装 `openyuanrong_datasystem` wheel，保证motor镜像内可执行 `dscli` 或 `dsc1`：
+在 P/D 节点motor镜像内安装 `openyuanrong_datasystem` wheel，保证motor镜像内可执行 `dscli` ：
 
 ```bash
 # <arch> 为 aarch64（ARM64）或 x86_64，如 manylinux_2_35_aarch64
@@ -138,19 +138,8 @@ D 实例的 kv_transfer_config
 
 `worker_args` 是 Worker 启动命令的**来源**,把普通的worker启动命令按照下面字符加逗号的方式修改然后填入即可
 
-- **可省略项**：`--worker_address` 可以不写——dscli/dsc1 会自动读取环境变量 `DS_WORKER_ADDR` / `ETCD_ADDRESS`（deployer 已注入）。建议不写，会自动读取pod的IP地址，否则worker ip需要跟真实pod ip对应。
-- **dsc1 风格**：
-  ```json
-  "worker_args": [
-    "dsc1", "start", "-t", "600", "-w",
-    "--worker_address", "{worker_address}",
-    "--etcd_address", "10.0.0.100:2379",
-    "--cluster_name", "etcd-cluster-1",
-    "--shared_memory_size_mb", "51200",
-    "--node_timeout_s", "300",
-    "--node_dead_timeout_s", "600",
-  ]
-  ```
+- **可省略项**：`--worker_address` 可以不写——dscli 会自动读取环境变量 `DS_WORKER_ADDR` / `ETCD_ADDRESS`（deployer 已注入）。建议不写，会自动读取pod的IP地址，否则worker ip需要跟真实pod ip对应。
+
 
 ### 3.3 执行部署
 
