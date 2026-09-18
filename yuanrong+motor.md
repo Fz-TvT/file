@@ -136,10 +136,10 @@ D 实例的 kv_transfer_config
 ```
 #### （3）worker_args 详解
 
-`worker_args` 是 Worker 启动命令的**来源**
+`worker_args` 是 Worker 启动命令的**来源**,把普通的worker启动命令按照下面字符加逗号的方式修改然后填入即可
 
 - **可省略项**：`--worker_address` 可以不写——dscli/dsc1 会自动读取环境变量 `DS_WORKER_ADDR` / `ETCD_ADDRESS`（deployer 已注入）。建议不写，会自动读取pod的IP地址，否则worker ip需要跟真实pod ip对应。
-- **dsc1 风格**（ModelArts 场景）：
+- **dsc1 风格**：
   ```json
   "worker_args": [
     "dsc1", "start", "-t", "600", "-w",
